@@ -4,8 +4,8 @@ Pipeline assíncrono de extração inteligente de documentos (notas fiscais, rec
 Você envia um PDF ou a foto de um recibo, recebe um `jobId` na hora, e o dado estruturado
 volta como JSON com **score de confiança** por campo.
 
-> **Status:** Fase 0 concluída — fluxo assíncrono ponta-a-ponta rodando local.
-> A extração é mockada nesta fase; o OCR real entra na Fase 1.
+> **Status:** Fase 0 concluída e camada de resiliência da Fase 1 no lugar
+> (idempotência, retry com backoff e DLQ). A extração ainda é mockada — o OCR real vem a seguir.
 
 ## O problema
 
@@ -106,18 +106,48 @@ Auth via header `X-API-Key`.
 
 ## Resiliência
 
-O que já está em pé na Fase 0:
-
 - **Durabilidade** — exchange, filas e mensagens persistentes; o job sobrevive a restart do broker.
 - **Ack manual** — a mensagem só sai da fila depois do resultado gravado. Se o worker morre
   no meio, o broker reentrega. Matar o worker durante o processamento não perde documento.
+- **Idempotência** — entrega ao menos uma vez é garantia do broker, não processamento único.
+  Cada mensagem é reservada por `messageId` com `SET NX` no Redis (atômico, então duas réplicas
+  não processam a mesma em paralelo), com o status terminal do job como segunda linha de defesa.
+- **Retry com backoff** — falha transitória volta para a fila depois de 5s, 30s e 2min.
+- **Dead-letter queue** — esgotadas as 4 tentativas, a mensagem para na DLQ e o job vira `failed`.
+  Nada some silenciosamente.
 - **Transação única** — resultado, status final e evento de auditoria entram juntos:
   nenhum job fica `completed` sem resultado.
 - **Graceful shutdown** — no SIGTERM o worker para de puxar mensagens novas, drena as em voo
   e só então encerra.
 - **Cache com fallback** — se o Redis cair, o `GET` de status vai ao Postgres e repovoa o cache.
 
-Fase 1 acrescenta: idempotência por `messageId`, retry com backoff, DLQ e OpenTelemetry.
+### Como o backoff funciona sem plugin
+
+```
+docpipe ──► document.uploaded ──(falhou)──► docpipe.retry ──► [fila com TTL]
+   ▲                                                               │
+   └───────────────(TTL expira, dead-letter devolve)───────────────┘
+```
+
+A mensagem que falha vai para uma fila **sem consumidor**, que só tem TTL e um dead-letter
+apontando de volta para a exchange principal. Quando o TTL expira, o próprio broker devolve
+a mensagem — o atraso sai de graça, sem `sleep` segurando worker e sem scheduler externo.
+
+É uma fila por degrau de atraso, não uma só com TTL por mensagem: com fila única, uma mensagem
+de espera longa na cabeça seguraria todas as de trás (*head-of-line blocking*).
+
+### Vendo funcionar
+
+```bash
+# perda zero: mata o worker no meio do processamento
+docker compose stop worker      # com jobs em voo
+docker compose start worker     # os jobs completam — o broker reentregou
+
+# inspecionar o que foi para a DLQ
+# RabbitMQ UI → Queues → document.uploaded.dlq
+```
+
+Fase 1 ainda acrescenta: OCR real em Python, webhooks assinados e OpenTelemetry.
 
 ## Segurança
 
@@ -129,5 +159,5 @@ Fase 1 acrescenta: idempotência por `messageId`, retry com backoff, DLQ e OpenT
 ## Roadmap
 
 - **Fase 0** ✅ fluxo assíncrono ponta-a-ponta, extração mockada
-- **Fase 1** — OCR real em Python, idempotência, retry + DLQ, webhooks assinados, OpenTelemetry
+- **Fase 1** 🔨 resiliência (idempotência, retry + DLQ) pronta; falta OCR, webhooks e OpenTelemetry
 - **Fase 2** — deploy em cloud com Terraform, autoscaling e teste de carga (throughput 1 vs N workers)

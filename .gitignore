@@ -1,0 +1,19 @@
+# .NET
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+# Ambiente (NUNCA commitar credenciais reais)
+.env
+.env.*
+!.env.example
+
+# Go
+worker-go/worker
+worker-go/*.exe
+
+# Sistema
+.DS_Store
+Thumbs.db

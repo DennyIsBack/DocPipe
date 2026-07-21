@@ -66,6 +66,14 @@ func run() error {
 	}
 	defer consumer.Close()
 
+	// Só marca o job como failed quando a mensagem esgota o retry — antes disso
+	// ela ainda vai voltar, e o job segue em processamento.
+	consumer.OnDeadLetter = func(ctx context.Context, msg queue.DocumentMessage, cause error) {
+		if err := repo.Fail(ctx, msg.JobID, cause.Error()); err != nil {
+			slog.Error("marcar job como failed", "jobId", msg.JobID, "error", err)
+		}
+	}
+
 	slog.Info("worker pronto", "queue", cfg.Queue, "prefetch", cfg.Prefetch)
 
 	return consumer.Consume(ctx, func(ctx context.Context, msg queue.DocumentMessage) error {
@@ -78,11 +86,36 @@ func handleDocument(
 ) error {
 	started := time.Now()
 
-	log := slog.With("jobId", msg.JobID, "correlationId", msg.CorrelationID)
+	log := slog.With(
+		"jobId", msg.JobID,
+		"correlationId", msg.CorrelationID,
+		"attempt", msg.Attempt)
+
+	// Idempotência: a primeira entrega reserva a mensagem; qualquer duplicata
+	// encontra a reserva e sai sem reprocessar.
+	claimed, err := repo.ClaimMessage(ctx, msg.MessageID)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		log.Info("mensagem duplicada, descartando", "messageId", msg.MessageID)
+		return nil
+	}
+
+	// Segunda linha de defesa, caso a reserva tenha expirado.
+	finished, err := repo.IsJobFinished(ctx, msg.JobID)
+	if err != nil {
+		return releaseAndFail(ctx, repo, msg, err)
+	}
+	if finished {
+		log.Info("job ja finalizado, descartando")
+		return nil
+	}
+
 	log.Info("processando documento", "storageKey", msg.StorageKey)
 
 	if err := repo.SetStatus(ctx, msg.JobID, "extracting"); err != nil {
-		return err
+		return releaseAndFail(ctx, repo, msg, err)
 	}
 
 	result := processing.Extract(msg.DocumentType)
@@ -90,18 +123,26 @@ func handleDocument(
 	if err := repo.SaveResult(
 		ctx, msg.JobID, result, result.OverallConfidence, result.NeedsReview,
 	); err != nil {
-		// Se não conseguimos gravar, marcamos o job como falho em vez de
-		// deixá-lo preso em "extracting" para sempre.
-		if failErr := repo.Fail(ctx, msg.JobID, err.Error()); failErr != nil {
-			log.Error("falha ao marcar job como failed", "error", failErr)
-		}
-		return err
+		return releaseAndFail(ctx, repo, msg, err)
 	}
 
 	log.Info("documento processado",
+		"messageId", msg.MessageID,
 		"confidence", result.OverallConfidence,
 		"needsReview", result.NeedsReview,
 		"durationMs", time.Since(started).Milliseconds())
 
 	return nil
+}
+
+// releaseAndFail devolve a reserva de idempotência antes de propagar o erro.
+// Sem isso a retentativa se veria como duplicata e o job travaria em
+// "extracting" para sempre.
+func releaseAndFail(
+	ctx context.Context, repo *storage.Repository, msg queue.DocumentMessage, cause error,
+) error {
+	if err := repo.ReleaseMessage(ctx, msg.MessageID); err != nil {
+		slog.Error("liberar reserva de idempotencia", "messageId", msg.MessageID, "error", err)
+	}
+	return cause
 }

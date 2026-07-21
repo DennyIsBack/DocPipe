@@ -15,6 +15,21 @@ public class Job
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; private set; } = DateTimeOffset.UtcNow;
 
+    /// <summary>Reconstrói um job já persistido, sem passar pelas regras de transição.</summary>
+    public static Job Restore(
+        Guid id, Guid documentId, string status, int attempt,
+        string? error, DateTimeOffset createdAt, DateTimeOffset updatedAt) =>
+        new()
+        {
+            Id = id,
+            DocumentId = documentId,
+            Status = status,
+            Attempt = attempt,
+            Error = error,
+            CreatedAt = createdAt,
+            UpdatedAt = updatedAt
+        };
+
     public void TransitionTo(string status)
     {
         if (!JobStatus.All.Contains(status))
